@@ -251,8 +251,18 @@ def create_http_stateless_mcp_app(
         from starlette.responses import RedirectResponse
         return RedirectResponse(url=f"{starlette_base_path}/", status_code=301)
     
-    # Add exact path redirect (e.g., /mcp -> /mcp/) - handle all methods
-    routes.append(Route(starlette_base_path, endpoint=redirect_mcp_root, methods=["GET", "POST", "OPTIONS"]))
+    # Create redirect handler for /mcp/http/ -> /mcp/http (remove trailing slash)
+    async def redirect_http_endpoint(request):
+        from starlette.responses import RedirectResponse
+        # Use 308 (Permanent Redirect) to preserve POST method and request body
+        # This ensures POST requests to /mcp/http/ are properly redirected to /mcp/http
+        return RedirectResponse(url=f"{starlette_base_path}/http", status_code=308)
+    
+    # Add exact path redirect (e.g., /mcp -> /mcp/) - handle MCP-specified methods only
+    routes.append(Route(starlette_base_path, endpoint=redirect_mcp_root, methods=["GET", "POST", "DELETE"]))
+    
+    # Add HTTP endpoint redirect (e.g., /mcp/http/ -> /mcp/http) - handle MCP-specified methods only
+    routes.append(Route(f"{starlette_base_path}/http/", endpoint=redirect_http_endpoint, methods=["GET", "POST", "DELETE"]))
     
     # Create main HTTP stateless endpoint handler for exact path only
     async def http_stateless_endpoint(request):
@@ -287,8 +297,8 @@ def create_http_stateless_mcp_app(
             headers=_convert_asgi_headers_to_dict(response_headers)
         )
     
-    # Add main MCP route with trailing slash - ONLY for exact path, not sub-paths
-    routes.append(Route(f"{starlette_base_path}/http", endpoint=http_stateless_endpoint, methods=["GET", "POST", "OPTIONS"]))
+    # Add main MCP route - ONLY for exact path, not sub-paths, MCP-specified methods only
+    routes.append(Route(f"{starlette_base_path}/http", endpoint=http_stateless_endpoint, methods=["GET", "POST", "DELETE"]))
     
     # Mount Django app at root
     routes.append(Mount("/", app=django_http_app))
