@@ -7,6 +7,7 @@ It supports both SSE (Server-Sent Events) and JSON response modes while maintain
 full compatibility with Django's existing MCP features.
 """
 
+import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator
@@ -165,7 +166,13 @@ class DjangoHttpStatelessServer:
             json_response=self.config.json_response,
             stateless=True,
         )
-        
+
+        # Initialize the session manager since lifespan may not be supported by Django runserver/uvicorn/other ASGI servers
+        self._session_manager_task: Optional[asyncio.Task] = None
+        self._session_manager_ready = asyncio.Event()
+        self._initialized = False
+        self._initialization_lock = asyncio.Lock()
+
         # Django tools are already loaded in the global mcp_app, no need to reload
         tools_count = len(mcp_app._tool_manager._tools) if hasattr(mcp_app, '_tool_manager') else 0
         logger.info(f"HTTP stateless transport using global mcp_app with {tools_count} tools")
@@ -182,10 +189,36 @@ class DjangoHttpStatelessServer:
             self.mcp_server.version = settings.MCP_SERVER_VERSION
         if hasattr(settings, 'MCP_SERVER_TITLE'):
             self.mcp_server.title = settings.MCP_SERVER_TITLE
-    
-    
+
+    async def _start_session_manager_background(self):
+        """Run the session manager in the background."""
+        try:
+            async with self.session_manager.run():
+                logger.info("MCP session manager started in background task")
+                self._session_manager_ready.set()  # Signal that it's ready
+                # Keep the context alive indefinitely
+                await asyncio.Event().wait()  # Wait forever
+        except Exception as e:
+            logger.error(f"Session manager background task failed: {e}")
+            raise
+
+    async def _ensure_session_manager_started(self):
+        """Idempotent session manager startup - safe to call multiple times."""
+        async with self._initialization_lock:
+            if self._initialized:
+                return
+
+            logger.info("Starting MCP session manager...")
+            self._session_manager_task = asyncio.create_task(
+                self._start_session_manager_background()
+            )
+            await self._session_manager_ready.wait()
+            self._initialized = True
+            logger.info("MCP session manager ready")
+
     async def handle_http_request(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Handle HTTP requests using the session manager."""
+        await self._ensure_session_manager_started()
         await self.session_manager.handle_request(scope, receive, send)
     
     async def handle_health_check(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -220,16 +253,6 @@ def create_http_stateless_mcp_app(
     # Convert Django-style path to Starlette format
     starlette_base_path = _convert_django_path_to_starlette(mcp_base_path)
     logger.debug(f"Converted Django-style base path for Starlette: {starlette_base_path}")
-    
-    @contextlib.asynccontextmanager
-    async def lifespan(app: Starlette) -> AsyncIterator[None]:
-        """Context manager for session manager."""
-        async with http_server.session_manager.run():
-            logger.info("Django HTTP stateless MCP server started!")
-            try:
-                yield
-            finally:
-                logger.info("Django HTTP stateless MCP server shutting down...")
     
     # Build routes list
     routes = []
@@ -297,7 +320,6 @@ def create_http_stateless_mcp_app(
     starlette_app = Starlette(
         debug=getattr(settings, 'DEBUG', False),
         routes=routes,
-        lifespan=lifespan
     )
     
     logger.info(f"Created Django HTTP stateless MCP app at {mcp_base_path}")
